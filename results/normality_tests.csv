@@ -1,0 +1,4 @@
+test,n,statistic,p_value,reject_at_5pct
+Shapiro–Wilk,4934,0.25911070032000644,1.5316234706964658e-88,True
+Jarque–Bera,4934,974655236.649718,0.0,True
+Anderson–Darling (estimated normal mean/variance),4934,inf,0.0,True

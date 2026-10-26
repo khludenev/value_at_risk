@@ -1,0 +1,18 @@
+{
+  "url": "https://tankermap.com/api/market-data/wti?period=MAX",
+  "retrieved_date_utc": "2026-10-25",
+  "sha256": "8f089ae67bc57dc00c13265f1a341b9dd27d01cabae8afc39ba6fc7aab1091a3",
+  "ticker": "WTI",
+  "n_bars": 5139,
+  "first_date": "2006-05-31",
+  "last_date": "2026-10-23",
+  "source_metadata": {
+    "lastUpdated": "2026-10-23T23:56:50.669892+00:00",
+    "freshnessWindow": "1 day",
+    "aggregationWindow": "MAX",
+    "source": "TankerMap market feed from KuzTerm daily OHLC bars",
+    "warnings": [
+      "stale_data"
+    ]
+  }
+}
