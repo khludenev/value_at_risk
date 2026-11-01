@@ -5,22 +5,18 @@ tail quantiles: an exception is r_t < q_t. No missing forecasts are imputed.
 """
 from __future__ import annotations
 
-import hashlib
-import importlib.metadata
 import itertools
-import json
-from pathlib import Path
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
-import requests
 from scipy import optimize, special, stats
 from arch import arch_model
 from arch.univariate import SkewStudent
 from numba import njit
 from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.diagnostic import acorr_ljungbox, normal_ad
 from tqdm.auto import tqdm
 
 ALPHA = 0.05
@@ -191,81 +187,6 @@ def pairwise_dm(y, forecasts, alpha=ALPHA):
     if valid.any():
         result.loc[valid, 'p_Holm'] = multipletests(result.loc[valid, 'p_value'], method='holm')[1]
     return result
-
-
-def parse_tankermap(payload):
-    if payload.get('ticker', '').upper() != 'WTI':
-        raise ValueError("This project expects the WTI feed.")
-    frame = pd.DataFrame(payload['bars'])
-    if not {'time', 'close'} <= set(frame):
-        raise ValueError("Unexpected TankerMap schema: expected bars/time/close.")
-    return clean_prices(frame.rename(columns={'time': 'date'})[['date', 'close']])
-
-
-def clean_prices(frame):
-    frame = frame.copy()
-    frame['date'] = pd.to_datetime(frame['date'], errors='raise')
-    frame['close'] = pd.to_numeric(frame['close'], errors='raise')
-    if frame['date'].isna().any() or frame['date'].duplicated().any():
-        raise ValueError("Missing or duplicated price dates; resolve at the source.")
-    if not np.isfinite(frame['close']).all():
-        raise ValueError("Nonfinite prices; explicitly remove source missing-value rows first.")
-    return frame.set_index('date')['close'].sort_index().rename('WTI_USD_per_barrel')
-
-
-def load_tankermap(cache='data/wti_tankermap_max.json', refresh=False):
-    path = Path(cache)
-    if refresh or not path.exists():
-        response = requests.get('https://tankermap.com/api/market-data/wti',
-                                params={'period': 'MAX'}, timeout=90)
-        response.raise_for_status()
-        payload = response.json()
-        parse_tankermap(payload)  # Validate before replacing a working snapshot.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2))
-        path.with_suffix('.provenance.json').write_text(json.dumps({
-            'url': response.url, 'retrieved_at_utc': pd.Timestamp.now(tz='UTC').isoformat(),
-            'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}, indent=2))
-    payload = json.loads(path.read_text())
-    return parse_tankermap(payload), payload.get('meta', {})
-
-
-def coverage_table(prices, start=2006, end=2025):
-    p = prices.loc[f'{start}':f'{end}']
-    rows = []
-    for year in range(start, end + 1):
-        yearly = p[p.index.year == year]
-        rows.append(dict(year=year, observations=len(yearly),
-                         first=yearly.index.min(), last=yearly.index.max()))
-    return pd.DataFrame(rows).set_index('year')
-
-
-def require_coverage(prices, start='2006-05-31', end='2025-12-31'):
-    first, last = pd.Timestamp(start), pd.Timestamp(end)
-    table = coverage_table(prices, first.year, last.year)
-    bad = []
-    for year, row in table.iterrows():
-        left, right = max(first, pd.Timestamp(year, 1, 1)), min(last, pd.Timestamp(year, 12, 31))
-        expected = len(pd.bdate_range(left, right))
-        if (row.observations < .75 * expected or pd.isna(row['first'])
-                or row['first'] > left + pd.Timedelta(days=14)
-                or row['last'] < right - pd.Timedelta(days=14)):
-            bad.append(year)
-    if bad:
-        raise ValueError(f"Insufficient {start}–{end} daily coverage in years {bad}. "
-                         f"Source range: {prices.index.min().date()}–{prices.index.max().date()}. "
-                         "Supply earlier WTI data or explicitly revise the study. No data were fabricated.")
-
-
-def raw_returns(prices):
-    if not prices.index.is_monotonic_increasing or prices.index.has_duplicates:
-        raise ValueError("Prices must be date-ordered with unique dates.")
-    if not np.isfinite(prices).all():
-        raise ValueError("Missing prices must be resolved before calculating returns.")
-    if (prices.shift(1) == 0).any():
-        raise ValueError("Raw percentage returns are undefined after a zero price.")
-    # Negative prices are retained; they are economically material for WTI.
-    return ((prices - prices.shift(1)) / prices.shift(1)).dropna().rename('return')
 
 
 def information_criteria(loglik, k, n):
@@ -439,14 +360,9 @@ def fit_caviar(y, spec='AS', alpha=ALPHA, seed=SEED, starts=8, warm=None, burn=7
         raise RuntimeError(f"All {spec} CAViaR optimization starts failed.")
     fit = min(successful, key=lambda r: r.fun)
     q = caviar_path(fit.x, y, q0, kind) / 100
-    # ALD working likelihood, on decimal returns; estimated scale counts as a parameter.
     loss = quantile_loss(y[burn:] / 100, q[burn:-1], alpha)
-    ald_scale = float(loss.mean())
-    loglik = len(loss) * (np.log(alpha * (1 - alpha)) - np.log(ald_scale) - 1)
-    boundary = any(min(abs(v - lo), abs(v - hi)) < 1e-5 for v, (lo, hi) in zip(fit.x, bounds))
     return dict(spec=spec, kind=kind, params=fit.x, q=q[:-1], forecast=float(q[-1]),
-                q0=q0, burn=burn, quantile_loss=ald_scale, converged=True, boundary=boundary,
-                successful_starts=len(successful), **information_criteria(loglik, len(fit.x) + 1, len(loss)))
+                q0=q0, burn=burn, quantile_loss=float(loss.mean()), n=len(loss))
 
 
 def caviar_gradient(y, fit):
@@ -480,14 +396,9 @@ def _gh_forecast_job(arguments):
 
 
 def rolling_forecasts(returns, model, start='2018-01-01', end='2025-12-31',
-                      window=504, alpha=ALPHA, output_dir='results', progress=True,
+                      window=504, alpha=ALPHA, progress=False,
                       caviar_starts=5, seed=SEED, gh_workers=1):
-    """Strict one-step rolling refits, checkpointed after each 25 dates.
-
-    Every fit sees exactly returns.iloc[i-window:i]. Failed dates are recorded
-    as NaN; they are never silently dropped or filled with another model.
-    Checkpoints are invalidated by input, source-code, config or package changes.
-    """
+    """Strict one-step rolling forecasts, using only the prior window."""
     if model not in {'GH', 'GJR-GARCH', 'AS-CAViaR'}:
         raise ValueError("Unknown rolling model.")
     if not returns.index.is_unique or not returns.index.is_monotonic_increasing or not np.isfinite(returns).all():
@@ -497,20 +408,9 @@ def rolling_forecasts(returns, model, start='2018-01-01', end='2025-12-31',
         raise ValueError("No observations in the forecast period.")
     if returns.index.get_loc(selected.index[0]) < window:
         raise ValueError("Insufficient pre-forecast history for a full window.")
-    config = dict(model=model, start=start, end=end, window=window, alpha=alpha,
-                  caviar_starts=caviar_starts, seed=seed,
-                  versions={p: importlib.metadata.version(p) for p in ['numpy', 'scipy', 'arch', 'numba']})
-    digest = hashlib.sha256(pd.util.hash_pandas_object(returns, index=True).values.tobytes()
-                            + json.dumps(config, sort_keys=True).encode() + Path(__file__).read_bytes()).hexdigest()
-    directory = Path(output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    checkpoint = directory / f'{model}_{digest[:16]}.json'
-    saved = json.loads(checkpoint.read_text()) if checkpoint.exists() else {'fingerprint': digest, 'config': config, 'rows': []}
-    if saved['fingerprint'] != digest:
-        raise ValueError("Checkpoint fingerprint mismatch.")
-    rows = saved['rows']
-    warm = np.array(rows[-1]['params']) if rows and rows[-1]['status'] == 'ok' else None
-    dates = selected.index[len(rows):]
+    values = []
+    warm = None
+    dates = selected.index
     executor = None
     gh_results = None
     if model == 'GH':
@@ -522,19 +422,10 @@ def rolling_forecasts(returns, model, start='2018-01-01', end='2025-12-31',
         else:
             gh_results = map(_gh_forecast_job, arguments)
 
-    def save():
-        saved['rows'] = rows
-        temporary = checkpoint.with_suffix('.tmp')
-        temporary.write_text(json.dumps(saved, indent=2, allow_nan=False))
-        temporary.replace(checkpoint)
-
     try:
         for date in tqdm(dates, desc=f'{model}: daily refits', disable=not progress):
             i = returns.index.get_loc(date)
             history = returns.iloc[i - window:i]
-            row = dict(date=date.isoformat(), train_start=history.index[0].isoformat(),
-                       train_end=history.index[-1].isoformat(), n_train=len(history),
-                       q=None, status='failed', params=None, detail='', boundary=False)
             try:
                 if model == 'GH':
                     outcome = next(gh_results)
@@ -542,46 +433,22 @@ def rolling_forecasts(returns, model, start='2018-01-01', end='2025-12-31',
                         raise RuntimeError(outcome['error'])
                     fit, value = outcome['fit'], outcome['value']
                     params = fit['params']
-                    row['boundary'] = fit['boundary']
-                    row['detail'] = fit['optimizer_message']
                 elif model == 'GJR-GARCH':
                     fit = fit_garch(history, warm=warm)
                     value, params = garch_quantile(fit, alpha), fit.params.to_numpy()
-                    row['detail'] = fit.var_project_warnings
                 else:
                     fit = fit_caviar(history, alpha=alpha, seed=seed + i, starts=caviar_starts, warm=warm)
                     value, params = fit['forecast'], fit['params']
-                    row['boundary'] = fit['boundary']
-                    row['detail'] = f"{fit['successful_starts']} converged starts"
                 if not np.isfinite(value):
                     raise RuntimeError("Nonfinite forecast quantile.")
-                row.update(q=value, status='ok', params=params.tolist())
+                values.append(value)
                 warm = params
             except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as exc:
-                row['detail'] = f'{type(exc).__name__}: {exc}'
-                warm = None
-            rows.append(row)
-            if len(rows) % 25 == 0:
-                save()
+                raise RuntimeError(f'{model} could not estimate the forecast for {date.date()}: {exc}') from exc
     finally:
-        save()
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
-    frame = pd.DataFrame(rows).set_index('date')
-    frame.index = pd.to_datetime(frame.index)
-    frame['q'] = pd.to_numeric(frame['q'], errors='coerce')
-    if not frame.index.equals(selected.index):
-        raise ValueError("Forecast dates do not match target returns.")
-    frame.to_csv(directory / f'{model}_forecasts.csv')
-    return frame
-
-
-def complete_quantiles(frame):
-    bad = frame[(frame.status != 'ok') | frame.q.isna()]
-    if len(bad):
-        raise ValueError(f"{len(bad)} daily fits failed. Inspect diagnostics before backtesting. "
-                         "Resolve the fits and invalidate the checkpoint to retry.")
-    return frame.q
+    return pd.Series(values, index=selected.index, name=model)
 
 
 def plot_var(y, q, title, ax=None):
@@ -599,3 +466,311 @@ def plot_var(y, q, title, ax=None):
     ax.set(title=title, xlabel='Date', ylabel='Return')
     ax.legend(loc='best')
     return ax
+
+
+def plot_var_periods(y, q, model_name):
+    """Two readable test-period panels with exceptions marked."""
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+    paired(y, q)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
+    periods = [('2018', '2021'), ('2022', '2025')]
+    for ax, (start, end) in zip(axes, periods):
+        sample_y, sample_q = y.loc[start:end], q.loc[start:end]
+        hit = sample_y < sample_q
+        ax.plot(sample_y.index, sample_y, color='#89949c', lw=.65, label='Return')
+        ax.plot(sample_q.index, sample_q, color='#b64a3a', lw=1.15, label='95% VaR')
+        ax.scatter(sample_y.index[hit], sample_y[hit], s=24, color='#9e192c', edgecolor='black',
+                   linewidth=.4, zorder=4, label=f'Exceptions ({int(hit.sum())})')
+        ax.yaxis.set_major_formatter(PercentFormatter(1))
+        ax.set(title=f'{model_name}: {start}–{end}', ylabel='Return')
+        ax.legend(loc='best')
+    axes[-1].set_xlabel('Date')
+    fig.tight_layout()
+    return fig
+
+
+# --- Compact notebook summaries -------------------------------------------------
+
+WIDTH = 76
+
+
+def _line(char='='):
+    print(char * WIDTH)
+
+
+def _num(value):
+    if value is None or not np.isfinite(value):
+        return 'NA'
+    if value != 0 and abs(value) < 0.0005:
+        return f'{value:.2e}'
+    return f'{value:.3f}'
+
+
+def _pvalue(value):
+    if value is None or not np.isfinite(value):
+        return 'NA'
+    return '<0.001' if value < 0.001 else f'{value:.3f}'
+
+
+def _decision(pvalue, alpha=.05):
+    if pvalue is None or not np.isfinite(pvalue):
+        return 'NA'
+    return 'FAIL' if pvalue < alpha else 'PASS'
+
+
+def _stars(pvalue):
+    if not np.isfinite(pvalue):
+        return ''
+    if pvalue < .001:
+        return '***'
+    if pvalue < .01:
+        return '**'
+    if pvalue < .05:
+        return '*'
+    return ''
+
+
+def print_download_summary(info):
+    """Print a short, human-readable record of the one WTI download."""
+    print('Download Summary')
+    _line('-')
+    for label, value in info.items():
+        print(f'{label:<30}{value:>24}')
+    _line('-')
+
+
+def print_split_summary(splits):
+    print('Sample Coverage')
+    _line('=')
+    print(f"{'Sample':<16}{'First return':<16}{'Last return':<16}{'Observations':>14}")
+    _line('-')
+    for name, values in splits.items():
+        print(f'{name:<16}{values.index.min():%Y-%m-%d}      {values.index.max():%Y-%m-%d}{len(values):>14,}')
+    _line('=')
+
+
+def print_return_summary(returns, asset='WTI', alpha=.05):
+    """R-style descriptive, normality and Ljung–Box report."""
+    x = np.asarray(returns, float)
+    missing = int(pd.isna(returns).sum())
+    descriptive = [
+        ('Mean', np.mean(x)), ('Std. deviation', np.std(x, ddof=1)),
+        ('Variance', np.var(x, ddof=1)), ('Minimum', np.min(x)),
+        ('1st Quartile', np.quantile(x, .25)), ('Median', np.median(x)),
+        ('3rd Quartile', np.quantile(x, .75)), ('Maximum', np.max(x)),
+        ('Skewness', stats.skew(x, bias=False)), ('Excess kurtosis', stats.kurtosis(x, bias=False)),
+    ]
+    sw = stats.shapiro(x)
+    ad_stat, ad_p = normal_ad(x)
+    jb = stats.jarque_bera(x)
+    lb_r = acorr_ljungbox(x, lags=[3, 5, 10], return_df=True)
+    lb_sq = acorr_ljungbox(x ** 2, lags=[3, 5, 10], return_df=True)
+    print('Return Distribution Summary')
+    _line('=')
+    print(f'Asset:          {asset}')
+    print('Variable:       Winsorised arithmetic returns')
+    print('Frequency:      Daily')
+    print(f'Sample:         {returns.index.min():%Y-%m-%d} to {returns.index.max():%Y-%m-%d}')
+    print(f'Observations:   {len(returns):,}')
+    print(f'Missing:        {missing:,}')
+    print('\nDescriptive Statistics')
+    _line('-')
+    print(f"{'Statistic':<28}{'Value':>12}")
+    _line('-')
+    for label, value in descriptive:
+        print(f'{label:<28}{_num(value):>12}')
+    print('\nNormality Tests')
+    _line('=')
+    print(f"{'Test':<24}{'Statistic':>12}{'p-value':>12}{'Decision':>12}")
+    _line('-')
+    for label, result in [('Shapiro-Wilk', sw), ('Anderson-Darling', (ad_stat, ad_p)), ('Jarque-Bera', jb)]:
+        print(f'{label:<24}{_num(result.statistic if hasattr(result, "statistic") else result[0]):>12}'
+              f'{_pvalue(result.pvalue if hasattr(result, "pvalue") else result[1]):>12}'
+              f'{_decision(result.pvalue if hasattr(result, "pvalue") else result[1], alpha):>12}')
+    print('\nLjung-Box Tests')
+    _line('=')
+    print(f"{'Lag':<8}{'Returns Q':>12}{'p-value':>12}{'Squared Q':>14}{'p-value':>12}")
+    _line('-')
+    for lag in [3, 5, 10]:
+        print(f'{lag:<8}{_num(lb_r.loc[lag, "lb_stat"]):>12}{_pvalue(lb_r.loc[lag, "lb_pvalue"]):>12}'
+              f'{_num(lb_sq.loc[lag, "lb_stat"]):>14}{_pvalue(lb_sq.loc[lag, "lb_pvalue"]):>12}')
+    print('\nDiagnostics')
+    _line('-')
+    print(f"Normality:              {'Rejected' if min(sw.pvalue, ad_p, jb.pvalue) < alpha else 'Not rejected'}")
+    print(f"Serial correlation:     {'Detected' if (lb_r.lb_pvalue < alpha).any() else 'Not detected'}")
+    print(f"Volatility clustering:  {'Detected' if (lb_sq.lb_pvalue < alpha).any() else 'Not detected'}")
+    print(f'Significance level:     {alpha:.3f}')
+    _line('=')
+
+
+def print_distribution_summary(fits):
+    print('Distribution Fit Comparison')
+    _line('=')
+    print(f"{'Distribution':<22}{'Observations':>14}{'Log-likelihood':>18}{'AIC':>12}{'BIC':>12}")
+    _line('-')
+    for name, fit in fits.items():
+        print(f'{name:<22}{fit["n"]:>14,}{_num(fit["loglik"]):>18}{_num(fit["AIC"]):>12}{_num(fit["BIC"]):>12}')
+    _line('=')
+    print('Lower AIC and BIC indicate preferred in-sample fit.')
+
+
+def _garch_scale(name):
+    return 1 / 10_000 if name == 'omega' else 1 / 100 if name == 'mu' else 1
+
+
+def print_garch_summary(fits):
+    names = list(fits)
+    parameters = ['mu', 'omega', 'alpha[1]', 'alpha[2]', 'gamma[1]', 'beta[1]', 'beta[2]', 'nu']
+    print('GARCH Model Comparison')
+    _line('=')
+    print(f"{'Parameter':<16}" + ''.join(f'{name:>19}' for name in names))
+    _line('-')
+    for parameter in parameters:
+        values = []
+        for fit in fits.values():
+            if parameter not in fit.params.index:
+                values.append('—')
+                continue
+            scale = _garch_scale(parameter)
+            estimate = fit.params[parameter] * scale
+            pvalue = fit.pvalues[parameter]
+            values.append(_num(estimate) + _stars(pvalue))
+        print(f'{parameter:<16}' + ''.join(f'{value:>19}' for value in values))
+    _line('-')
+    print(f"{'Log-likelihood':<16}" + ''.join(f'{_num(fit.loglikelihood + fit.nobs*np.log(100)):>19}' for fit in fits.values()))
+    print(f"{'AIC':<16}" + ''.join(f'{_num((2*fit.num_params - 2*(fit.loglikelihood + fit.nobs*np.log(100)))/fit.nobs):>19}' for fit in fits.values()))
+    print(f"{'BIC':<16}" + ''.join(f'{_num((np.log(fit.nobs)*fit.num_params - 2*(fit.loglikelihood + fit.nobs*np.log(100)))/fit.nobs):>19}' for fit in fits.values()))
+    _line('=')
+    print('Innovations: standardized Student-t. AIC/BIC are reported per observation.')
+    print('Significance codes: *** p<0.001  ** p<0.01  * p<0.05')
+
+
+def caviar_inference(y, fit, alpha=ALPHA):
+    """Kernel sandwich standard errors for the fitted CAViaR recursion."""
+    burn = fit['burn']
+    gradient = caviar_gradient(y, fit)[burn:]
+    residual = np.asarray(y, float)[burn:] - fit['q'][burn:]
+    n = len(residual)
+    robust_scale = min(np.std(residual), stats.iqr(residual) / 1.349)
+    bandwidth = max(1e-8, 1.06 * robust_scale * n ** (-1 / 5))
+    density_weights = (np.abs(residual) < bandwidth) / (2 * bandwidth)
+    a = gradient.T @ (density_weights[:, None] * gradient) / n
+    b = gradient.T @ gradient / n
+    covariance = alpha * (1 - alpha) * np.linalg.pinv(a) @ b @ np.linalg.pinv(a) / n
+    se = np.sqrt(np.clip(np.diag(covariance), 0, np.inf))
+    z = np.divide(fit['params'], se, out=np.full_like(se, np.nan), where=se > 0)
+    pvalue = 2 * stats.norm.sf(np.abs(z))
+    return dict(se=se, lower=fit['params'] - 1.96 * se, upper=fit['params'] + 1.96 * se,
+                pvalue=pvalue, bandwidth=bandwidth)
+
+
+def print_caviar_summary(fits, y, alpha=ALPHA):
+    labels = {'SAV': ['Beta 0', 'Beta 1', 'Gamma 1'],
+              'AS': ['Beta 0', 'Beta 1', 'Gamma 1', 'Gamma 2'],
+              'INDGARCH': ['Beta 0', 'Beta 1', 'Gamma 1']}
+    inference = {name: caviar_inference(y, fit, alpha) for name, fit in fits.items()}
+    rows = ['Beta 0', 'Beta 1', 'Gamma 1', 'Gamma 2']
+    print('CAViaR Model Comparison')
+    _line('=')
+    print(f"{'Parameter':<16}" + ''.join(f'{name:>19}' for name in fits))
+    _line('-')
+    for row in rows:
+        values = []
+        for name, fit in fits.items():
+            if row not in labels[name]:
+                values.append('—')
+                continue
+            index = labels[name].index(row)
+            estimate = fit['params'][index]
+            values.append(_num(estimate) + _stars(inference[name]['pvalue'][index]))
+        print(f'{row:<16}' + ''.join(f'{value:>19}' for value in values))
+    print('\n95% confidence intervals')
+    _line('-')
+    print(f"{'Parameter':<16}" + ''.join(f'{name:>19}' for name in fits))
+    for row in rows:
+        values = []
+        for name, fit in fits.items():
+            if row not in labels[name]:
+                values.append('—')
+                continue
+            index = labels[name].index(row)
+            values.append(f'[{_num(inference[name]["lower"][index])}, {_num(inference[name]["upper"][index])}]')
+        print(f'{row:<16}' + ''.join(f'{value:>19}' for value in values))
+    _line('-')
+    print(f"{'Mean quantile loss':<16}" + ''.join(f'{_num(fit["quantile_loss"]):>19}' for fit in fits.values()))
+    print(f"{'In-sample coverage':<16}" + ''.join(f'{_num(np.mean(np.asarray(y)[fit["burn"]:] < fit["q"][fit["burn"]:])):>19}' for fit in fits.values()))
+    _line('=')
+    print('Returns are expressed in percent inside the CAViaR recursion.')
+    print('95% confidence intervals use kernel sandwich standard errors.')
+    print('Significance codes: *** p<0.001  ** p<0.01  * p<0.05')
+
+
+def print_backtest_summary(name, result, alpha=ALPHA):
+    expected = result['n'] * alpha
+    print('VaR Backtesting Results')
+    _line('=')
+    print(f'Model:          {name}')
+    print(f'VaR level:      {alpha:.1%}')
+    print(f'Observations:   {int(result["n"]):,}')
+    print('\nCoverage')
+    _line('-')
+    print(f'Exceptions:          {int(result["exceptions"])} / {int(result["n"])}')
+    print(f'Expected rate:       {alpha:.3%}')
+    print(f'Observed rate:       {result["rate"]:.3%}')
+    print(f'Expected exceptions: {expected:.3f}')
+    print('\nTransition Matrix')
+    _line('-')
+    print(f"{'':<20}{'I(t) = 0':>14}{'I(t) = 1':>14}{'Total':>14}")
+    print(f"{'I(t-1) = 0':<20}{int(result['n00']):>14}{int(result['n01']):>14}{int(result['n00']+result['n01']):>14}")
+    print(f"{'I(t-1) = 1':<20}{int(result['n10']):>14}{int(result['n11']):>14}{int(result['n10']+result['n11']):>14}")
+    print(f"{'Total':<20}{int(result['n00']+result['n10']):>14}{int(result['n01']+result['n11']):>14}{int(result['n']-1):>14}")
+    print(f"P(0 -> 1) = {result['n01']/(result['n00']+result['n01']):.3f}    P(1 -> 1) = {result['n11']/(result['n10']+result['n11']):.3f}")
+    print('\nStatistical Tests')
+    _line('=')
+    print(f"{'Test':<26}{'Statistic':>12}{'p-value':>12}{'Decision':>12}")
+    _line('-')
+    tests = [('Kupiec uncond. coverage', result['LR_uc'], result['p_uc']), ('Christoffersen independence', result['LR_ind'], result['p_ind']),
+             ('Christoffersen cond. cov.', result['LR_cc'], result['p_cc']), ('Dynamic Quantile', result['DQ_DQ'], result['DQ_p_DQ']),
+             ('Exact Binomial', np.nan, result['p_binomial'])]
+    for label, statistic, pvalue in tests:
+        print(f'{label:<26}{_num(statistic):>12}{_pvalue(pvalue):>12}{_decision(pvalue, alpha):>12}')
+    print('\nLoss Functions')
+    _line('-')
+    for label, key in [('Lopez', 'Lopez_mean'), ('Quantile', 'Quantile_mean'), ('Blanco-Ihle', 'Blanco_Ihle_mean')]:
+        print(f'{label:<26}{_num(result[key]):>12}')
+    _line('=')
+    print('PASS means the null hypothesis is not rejected at the stated level.')
+
+
+def print_final_backtest_summary(results):
+    print('VaR Model Comparison')
+    _line('=')
+    print(f"{'Model':<22}{'Observations':>14}{'Exceptions':>14}{'Rate':>12}{'Rejected tests':>16}")
+    _line('-')
+    for name, result in results.items():
+        rejected = sum(result[p] < .05 for p in ['p_uc', 'p_ind', 'p_cc', 'DQ_p_DQ', 'p_binomial'])
+        print(f'{name:<22}{int(result["n"]):>14,}{int(result["exceptions"]):>14}{result["rate"]:>12.3%}{rejected:>16}')
+    _line('-')
+    print(f"{'Model':<22}{'Kupiec p':>14}{'IND p':>14}{'CC p':>14}{'DQ p':>16}")
+    for name, result in results.items():
+        print(f'{name:<22}{_pvalue(result["p_uc"]):>14}{_pvalue(result["p_ind"]):>14}{_pvalue(result["p_cc"]):>14}{_pvalue(result["DQ_p_DQ"]):>16}')
+    _line('-')
+    print(f"{'Model':<22}{'Lopez':>14}{'Quantile':>14}{'Blanco-Ihle':>14}")
+    for name, result in results.items():
+        print(f'{name:<22}{_num(result["Lopez_mean"]):>14}{_num(result["Quantile_mean"]):>14}{_num(result["Blanco_Ihle_mean"]):>14}')
+    _line('=')
+
+
+def print_dm_summary(results):
+    print('Diebold-Mariano Test Results')
+    _line('=')
+    print('Loss function: Quantile loss     Variance estimator: HAC     Significance: 0.05')
+    _line('-')
+    print(f"{'Model A':<20}{'Model B':<20}{'DM stat.':>12}{'p-value':>12}{'Holm p':>12}{'Mean diff.':>14}")
+    _line('-')
+    for _, row in results.iterrows():
+        print(f'{row.model_A:<20}{row.model_B:<20}{_num(row.DM):>12}{_pvalue(row.p_value):>12}'
+              f'{_pvalue(row.p_Holm):>12}{_num(row.mean_difference):>14}')
+    _line('=')
+    print('A negative statistic favours Model A. Holm p-values adjust for three comparisons.')
